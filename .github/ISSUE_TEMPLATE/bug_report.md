@@ -21,4 +21,4 @@ A clear and concise description of what you expected to happen.
 **Environment:**
  - OS: [e.g. macOS, Ubuntu, Windows/WSL]
  - Python version: [e.g. 3.11.0]
- - TokenDiet version: [e.g. 1.1.0]
+ - TokenDiet version: [e.g. 1.2.0]

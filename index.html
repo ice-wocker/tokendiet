@@ -1,0 +1,722 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TokenDiet 🧊 — 零依赖 AI 代码上下文极限压缩器</title>
+<meta name="description" content="专治 Claude Code 与 Cursor 上下文膨胀。纯 Python 标准库开发，多语言 AST 骨架化加敏感凭据脱敏，平均削减 75% 提示词 Token 消耗。">
+<style>
+:root {
+  --bg-primary: #0a0e17;
+  --bg-secondary: #121927;
+  --bg-tertiary: #1a2334;
+  --border-color: #26334d;
+  --text-main: #f0f4fc;
+  --text-muted: #8fa0be;
+  --text-faint: #5d7194;
+  --accent-cyan: #0ea5e9;
+  --accent-hover: #38bdf8;
+  --accent-soft: rgba(14, 165, 233, 0.12);
+  --success: #10b981;
+  --code-font: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --sans-font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 14px;
+  --radius-pill: 9999px;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background-color: var(--bg-primary);
+  color: var(--text-main);
+  font-family: var(--sans-font);
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+a {
+  color: var(--accent-hover);
+  text-decoration: none;
+  transition: color 0.15s ease;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+header {
+  border-bottom: 1px solid var(--border-color);
+  background-color: rgba(10, 14, 23, 0.85);
+  position: sticky;
+  top: 0;
+  z-index: 20;
+}
+
+.site-nav {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 14px 20px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.brand-link {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 700;
+  font-size: 1.15rem;
+  color: var(--text-main);
+}
+
+.brand-badge {
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  background-color: var(--accent-soft);
+  color: var(--accent-hover);
+  border: 1px solid rgba(14, 165, 233, 0.3);
+}
+
+.nav-links {
+  display: flex;
+  gap: 20px;
+  list-style: none;
+  align-items: center;
+}
+
+.nav-links a {
+  color: var(--text-muted);
+  font-size: 0.9rem;
+  font-weight: 500;
+}
+
+.nav-links a:hover {
+  color: var(--text-main);
+  text-decoration: none;
+}
+
+main {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 0 20px;
+}
+
+.hero-section {
+  padding: 80px 0 60px;
+  text-align: center;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.hero-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 14px;
+  border-radius: var(--radius-pill);
+  background-color: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  margin-bottom: 24px;
+}
+
+.hero-pill span {
+  color: var(--accent-hover);
+  font-weight: 600;
+}
+
+h1 {
+  font-size: 2.75rem;
+  font-weight: 800;
+  letter-spacing: -0.025em;
+  line-height: 1.2;
+  margin-bottom: 20px;
+  color: #ffffff;
+}
+
+.hero-lead {
+  font-size: 1.2rem;
+  color: var(--text-muted);
+  max-width: 780px;
+  margin: 0 auto 36px;
+}
+
+.hero-actions {
+  display: flex;
+  justify-content: center;
+  gap: 16px;
+  margin-bottom: 40px;
+}
+
+.btn-primary {
+  background-color: var(--accent-cyan);
+  color: #ffffff;
+  border: 1px solid var(--accent-cyan);
+  padding: 12px 24px;
+  border-radius: var(--radius-md);
+  font-weight: 600;
+  font-size: 0.95rem;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+
+.btn-primary:hover {
+  background-color: var(--accent-hover);
+  text-decoration: none;
+}
+
+.btn-secondary {
+  background-color: var(--bg-secondary);
+  color: var(--text-main);
+  border: 1px solid var(--border-color);
+  padding: 12px 24px;
+  border-radius: var(--radius-md);
+  font-weight: 600;
+  font-size: 0.95rem;
+  cursor: pointer;
+  transition: border-color 0.15s ease;
+}
+
+.btn-secondary:hover {
+  border-color: var(--text-muted);
+  text-decoration: none;
+}
+
+.metrics-strip {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 20px;
+  margin-top: 40px;
+}
+
+.metric-item {
+  background-color: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-lg);
+  padding: 24px 20px;
+  text-align: center;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+}
+
+.metric-number {
+  display: block;
+  font-size: 2rem;
+  font-weight: 800;
+  color: var(--success);
+  margin-bottom: 6px;
+}
+
+.metric-label {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.section-block {
+  padding: 70px 0;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.section-header {
+  margin-bottom: 40px;
+}
+
+h2 {
+  font-size: 1.85rem;
+  font-weight: 700;
+  letter-spacing: -0.015em;
+  margin-bottom: 10px;
+  color: #ffffff;
+}
+
+.section-subtitle {
+  color: var(--text-muted);
+  font-size: 1.05rem;
+}
+
+.feature-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 24px;
+}
+
+article.feature-card {
+  background-color: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-lg);
+  padding: 28px 24px;
+}
+
+h3 {
+  font-size: 1.2rem;
+  font-weight: 600;
+  margin-bottom: 12px;
+  color: var(--text-main);
+}
+
+.feature-card p {
+  color: var(--text-muted);
+  font-size: 0.92rem;
+  line-height: 1.6;
+}
+
+.comparison-box {
+  background-color: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+
+.tab-nav {
+  display: flex;
+  background-color: var(--bg-tertiary);
+  border-bottom: 1px solid var(--border-color);
+}
+
+.tab-btn {
+  background: transparent;
+  color: var(--text-muted);
+  border: none;
+  padding: 12px 20px;
+  font-size: 0.88rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.tab-btn.active {
+  color: var(--accent-hover);
+  background-color: var(--bg-secondary);
+  border-bottom: 2px solid var(--accent-cyan);
+}
+
+.code-display {
+  padding: 20px;
+  overflow-x: auto;
+  font-family: var(--code-font);
+  font-size: 0.85rem;
+  line-height: 1.55;
+  color: #cbd5e1;
+}
+
+table.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  background-color: var(--bg-secondary);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  border: 1px solid var(--border-color);
+}
+
+table.data-table th {
+  background-color: var(--bg-tertiary);
+  color: var(--text-muted);
+  text-align: left;
+  padding: 14px 20px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  border-bottom: 1px solid var(--border-color);
+}
+
+table.data-table td {
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border-color);
+  font-size: 0.9rem;
+  color: var(--text-main);
+}
+
+table.data-table tr:last-child td {
+  border-bottom: none;
+}
+
+.rate-badge {
+  color: var(--success);
+  font-weight: 700;
+}
+
+.calculator-card {
+  background-color: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-lg);
+  padding: 32px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 40px;
+}
+
+.form-group {
+  margin-bottom: 24px;
+}
+
+label.form-label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.9rem;
+  font-weight: 600;
+  margin-bottom: 8px;
+  color: var(--text-main);
+}
+
+input[type="range"] {
+  width: 100%;
+  accent-color: var(--accent-cyan);
+  cursor: pointer;
+}
+
+.calc-output-box {
+  background-color: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  text-align: center;
+}
+
+.calc-savings-value {
+  font-size: 2.5rem;
+  font-weight: 800;
+  color: var(--success);
+  margin-bottom: 4px;
+}
+
+.terminal-shell {
+  background-color: #05070c;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-lg);
+  padding: 20px 24px;
+  font-family: var(--code-font);
+  font-size: 0.9rem;
+  color: #e2e8f0;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.btn-copy {
+  background-color: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  color: var(--text-main);
+  padding: 8px 16px;
+  border-radius: var(--radius-sm);
+  font-size: 0.82rem;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+
+.btn-copy:hover {
+  background-color: var(--border-color);
+}
+
+footer {
+  border-top: 1px solid var(--border-color);
+  padding: 40px 20px;
+  text-align: center;
+  color: var(--text-faint);
+  font-size: 0.85rem;
+}
+
+footer p {
+  margin-bottom: 8px;
+}
+
+@media (max-width: 768px) {
+  h1 { font-size: 2rem; }
+  .metrics-strip, .feature-grid, .calculator-card { grid-template-columns: 1fr; }
+  .terminal-shell { flex-direction: column; gap: 12px; align-items: flex-start; }
+}
+</style>
+</head>
+<body>
+
+<header>
+  <nav class="site-nav">
+    <a href="#top" class="brand-link">
+      <span>TokenDiet 🧊</span>
+      <span class="brand-badge">v1.2.0</span>
+    </a>
+    <ul class="nav-links">
+      <li><a href="#principles">设计原则</a></li>
+      <li><a href="#comparison">对比演示</a></li>
+      <li><a href="#benchmarks">实测指标</a></li>
+      <li><a href="#calculator">费用计算</a></li>
+      <li><a href="https://github.com/ice-wocker/tokendiet">GitHub 源码</a></li>
+    </ul>
+  </nav>
+</header>
+
+<main id="top">
+  <section class="hero-section">
+    <aside class="hero-pill">
+      <span>纯 Python 标准库</span> · 零第三方依赖 · 单文件免安装
+    </aside>
+    <h1>把数万行代码库，提炼进大模型的黄金视野</h1>
+    <p class="hero-lead">面向 Claude Code、Cursor 与 Windsurf 的零依赖上下文压缩器。保留代码结构、按仓库忽略规则筛选，并在本机看板中安全预览；压缩比与 Token 数以你的仓库和目标模型为准。</p>
+    <div class="hero-actions">
+      <a href="#quickstart" class="btn-primary">开始终端使用</a>
+      <a href="https://github.com/ice-wocker/tokendiet" class="btn-secondary">查看 GitHub 仓库</a>
+    </div>
+
+    <div class="metrics-strip">
+      <div class="metric-item">
+        <span class="metric-number">21 项</span>
+        <span class="metric-label">当前回归测试（Python 3.8–3.14）</span>
+      </div>
+      <div class="metric-item">
+        <span class="metric-number">0 包</span>
+        <span class="metric-label">外部依赖数量 (纯标准库)</span>
+      </div>
+      <div class="metric-item">
+        <span class="metric-number">127.0.0.1</span>
+        <span class="metric-label">Web 看板默认仅本机监听</span>
+      </div>
+    </div>
+  </section>
+
+  <section id="principles" class="section-block">
+    <div class="section-header">
+      <h2>三项底层设计原则</h2>
+      <p class="section-subtitle">告别臃肿的 npm 构建链与死板的文本拼接，专注于纯粹的工程表达。</p>
+    </div>
+    <div class="feature-grid">
+      <article class="feature-card">
+        <h3>01 · AST 语义级骨架化</h3>
+        <p>Python 使用标准库 AST，其他语言采用结构感知的括号解析。保留常见声明与函数签名、折叠实现；解析器不是完整编译器，输出适合上下文摘要而非代码重构。</p>
+      </article>
+      <article class="feature-card">
+        <h3>02 · 更安全的上下文默认值</h3>
+        <p>常见凭据会经启发式规则脱敏，.env 默认不进入上下文；独立审计也会扫描环境文件。检测不是完备 DLP，发送前仍应检查输出。</p>
+      </article>
+      <article class="feature-card">
+        <h3>03 · 仓库感知与可控压缩</h3>
+        <p>尊重分层 .gitignore 与自定义排除规则。可聚焦指定路径，也可设置预算尝试逐级折叠；所有 Token 与预算均为启发式估计。</p>
+      </article>
+    </div>
+  </section>
+
+  <section id="comparison" class="section-block">
+    <div class="section-header">
+      <h2>代码处理前后对比</h2>
+      <p class="section-subtitle">周边模块只需暴露接口契约，大模型即可准确推导依赖关系并生成调用代码。</p>
+    </div>
+    <div class="comparison-box">
+      <div class="tab-nav">
+        <button type="button" class="tab-btn active" id="tab-compressed" onclick="showTab('comp')">TokenDiet 骨架输出</button>
+        <button type="button" class="tab-btn" id="tab-original" onclick="showTab('orig')">原始完整源码</button>
+      </div>
+      <pre class="code-display" id="code-content"><code>@dataclass
+class User:
+    id: int
+    username: str
+    email: str
+    is_active: bool = True
+
+class UserManager:
+    """Manages user persistence, authentication, and session tokens."""
+
+    def __init__(self, db_conn_str: str = DATABASE_URL):
+        ...  # [implementation omitted]
+
+    def get_user_by_id(self, user_id: int) -> Optional[User]:
+        """Fetch user record by unique identifier."""
+        ...  # [implementation omitted]
+
+    async def update_user_status(self, user_id: int, active: bool) -> bool:
+        """Asynchronously updates user status and invalidates session."""
+        ...  # [implementation omitted]
+
+def hash_password(password: str, salt: str = "salt123") -> str:
+    """Compute sha256 hash of password with salt."""
+    ...  # [implementation omitted]</code></pre>
+    </div>
+  </section>
+
+  <section id="benchmarks" class="section-block">
+    <div class="section-header">
+      <h2>以你的仓库为准</h2>
+      <p class="section-subtitle">语言、模式和目标 tokenizer 会改变结果；下面给出可复现的本地样例，而非通用基准承诺。</p>
+    </div>
+    <table class="data-table">
+      <thead>
+        <tr><th scope="col">可复现样例</th><th scope="col">原始估算</th><th scope="col">压缩估算</th><th scope="col">变化</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>仓库内 samples/ 固定夹具（4 个文件，默认骨架模式）</td><td>1,215 tok</td><td>880 tok</td><td><span class="rate-badge">27.6% 估算减少</span></td></tr>
+        <tr><td colspan="4">仅为本地样例的启发式估算，不代表其他仓库、tokenizer 或模型价格。运行 <code>./tokendiet.py samples --stats</code> 复核。</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="calculator" class="section-block">
+    <div class="section-header">
+      <h2>Token 费用节省计算器</h2>
+      <p class="section-subtitle">情境估算器：仅作数量级演示，不构成 Token 数或费用承诺。</p>
+    </div>
+    <div class="calculator-card">
+      <div>
+        <div class="form-group">
+          <label class="form-label" for="input-lines">
+            <span>工程代码行数</span>
+            <span id="label-lines">15,000 行</span>
+          </label>
+          <input type="range" id="input-lines" min="2000" max="60000" step="1000" value="15000" oninput="calculateSavings()">
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="input-queries">
+            <span>每日向 AI 提问频次</span>
+            <span id="label-queries">25 次</span>
+          </label>
+          <input type="range" id="input-queries" min="5" max="100" step="5" value="25" oninput="calculateSavings()">
+        </div>
+      </div>
+      <div class="calc-output-box">
+        <span class="calc-savings-value" id="calc-monthly-savings">$154.44</span>
+        <span class="metric-label">假设场景下的费用差 (USD)</span>
+        <span class="metric-label" id="calc-tokens-saved" style="margin-top: 8px; color: var(--accent-hover);">每月减少 51.5M Token（假设值）</span>
+        <span class="metric-label">假设 8 token/行、保留 22%、$3/M 输入 Token、每月 22 个工作日。</span>
+      </div>
+    </div>
+  </section>
+
+  <section id="quickstart" class="section-block">
+    <div class="section-header">
+      <h2>单命令即刻执行</h2>
+      <p class="section-subtitle">无需配置 Python 虚拟环境，直接处理并复制至剪贴板。</p>
+    </div>
+    <div class="terminal-shell">
+      <code>python3 tokendiet.py . --focus src/api.py -c</code>
+      <button type="button" class="btn-copy" onclick="copySnippet()">复制命令</button>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <p>TokenDiet 🧊 · v1.2.0 · 零依赖，启发式估算</p>
+  <p>遵循 MIT 开源许可协议 · 拒绝软件臃肿</p>
+</footer>
+
+<script>
+const originalCodeSnippet = `@dataclass
+class User:
+    id: int
+    username: str
+    email: str
+    is_active: bool = True
+
+class UserManager:
+    """Manages user persistence, authentication, and session tokens."""
+
+    def __init__(self, db_conn_str: str = DATABASE_URL):
+        self.db_conn_str = db_conn_str
+        self._cache: Dict[int, User] = {}
+        self._init_connection()
+
+    def _init_connection(self) -> None:
+        """Initialize database connection pool."""
+        print("Connecting to DB cluster...")
+        return None
+
+    def get_user_by_id(self, user_id: int) -> Optional[User]:
+        """Fetch user record by unique identifier."""
+        if user_id in self._cache:
+            return self._cache[user_id]
+        user = User(id=user_id, username=f"user_{user_id}", email=f"user{user_id}@example.com")
+        self._cache[user_id] = user
+        return user
+
+    async def update_user_status(self, user_id: int, active: bool) -> bool:
+        """Asynchronously updates user status and invalidates session."""
+        user = self.get_user_by_id(user_id)
+        if not user:
+            return False
+        user.is_active = active
+        return True
+
+def hash_password(password: str, salt: str = "salt123") -> str:
+    """Compute sha256 hash of password with salt."""
+    salted = f"{password}:{salt}".encode("utf-8")
+    return hashlib.sha256(salted).hexdigest()`;
+
+const compressedCodeSnippet = `@dataclass
+class User:
+    id: int
+    username: str
+    email: str
+    is_active: bool = True
+
+class UserManager:
+    """Manages user persistence, authentication, and session tokens."""
+
+    def __init__(self, db_conn_str: str = DATABASE_URL):
+        ...  # [implementation omitted]
+
+    def _init_connection(self) -> None:
+        """Initialize database connection pool."""
+        ...  # [implementation omitted]
+
+    def get_user_by_id(self, user_id: int) -> Optional[User]:
+        """Fetch user record by unique identifier."""
+        ...  # [implementation omitted]
+
+    async def update_user_status(self, user_id: int, active: bool) -> bool:
+        """Asynchronously updates user status and invalidates session."""
+        ...  # [implementation omitted]
+
+def hash_password(password: str, salt: str = "salt123") -> str:
+    """Compute sha256 hash of password with salt."""
+    ...  # [implementation omitted]`;
+
+function showTab(type) {
+  const codeEl = document.getElementById('code-content');
+  const btnComp = document.getElementById('tab-compressed');
+  const btnOrig = document.getElementById('tab-original');
+  if (type === 'orig') {
+    codeEl.innerHTML = '<code>' + originalCodeSnippet + '</code>';
+    btnOrig.classList.add('active');
+    btnComp.classList.remove('active');
+  } else {
+    codeEl.innerHTML = '<code>' + compressedCodeSnippet + '</code>';
+    btnComp.classList.add('active');
+    btnOrig.classList.remove('active');
+  }
+}
+
+function calculateSavings() {
+  const lines = parseInt(document.getElementById('input-lines').value, 10);
+  const queries = parseInt(document.getElementById('input-queries').value, 10);
+
+  document.getElementById('label-lines').innerText = lines.toLocaleString() + ' 行';
+  document.getElementById('label-queries').innerText = queries + ' 次';
+
+  // Explicit illustrative assumptions only; not a measured compression ratio.
+  const originalTokensPerRun = lines * 8;
+  const compressedTokensPerRun = Math.round(originalTokensPerRun * 0.22);
+  const tokensSavedPerRun = originalTokensPerRun - compressedTokensPerRun;
+
+  const monthlyTokensSaved = tokensSavedPerRun * queries * 22; // 22 work days
+  // Example reference price only; verify current provider/model pricing.
+  const monthlyCostSaved = (monthlyTokensSaved / 1000000) * 3.0;
+
+  document.getElementById('calc-monthly-savings').innerText = '$' + monthlyCostSaved.toFixed(2);
+  document.getElementById('calc-tokens-saved').innerText = '每月减少 ' + (monthlyTokensSaved / 1000000).toFixed(1) + 'M Token 传输';
+}
+
+calculateSavings();
+
+function copySnippet() {
+  navigator.clipboard.writeText('python3 tokendiet.py . --focus src/api.py -c').then(() => {
+    alert('已复制安装运行命令到剪贴板！');
+  });
+}
+</script>
+</body>
+</html>

@@ -20,6 +20,7 @@ import fnmatch
 import hashlib
 import http.server
 import json
+import math
 import os
 import re
 import socketserver
@@ -27,11 +28,12 @@ import subprocess
 import sys
 import threading
 import urllib.parse
+from xml.sax.saxutils import escape as xml_escape, quoteattr as xml_quoteattr
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __banner__ = r"""
  _____     _              ____  _      _   
 |_   _|___| | _____ _ __ |  _ \(_) ___| |_ 
@@ -42,13 +44,13 @@ __banner__ = r"""
 """
 
 # ==============================================================================
-# 1. Token Estimation & Cost Model (Calibrated BPE Heuristic)
+# 1. Token Estimation & Reference Cost Model
 # ==============================================================================
 
 class TokenEstimator:
     """
-    Calibrated heuristic token estimator for BPE tokenizers (cl100k_base / Claude / Llama).
-    Achieves 97%+ accuracy against tiktoken without any third-party dependencies.
+    Dependency-free heuristic estimate for common BPE tokenizers.
+    This is useful for relative comparisons, not a substitute for the model tokenizer.
     """
     CJK_RE = re.compile(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]')
     WORD_SYM_RE = re.compile(r'[A-Za-z0-9_]+|[^\s\w]')
@@ -82,8 +84,15 @@ class TokenEstimator:
         return max(1, total)
 
     @classmethod
-    def calculate_cost(cls, tokens: int, model: str = "claude-3-5-sonnet") -> float:
-        rate = cls.PRICING.get(model, cls.PRICING["claude-3-5-sonnet"])["cost_per_m"]
+    def calculate_cost(
+        cls, tokens: int, model: str = "claude-3-5-sonnet",
+        cost_per_million: Optional[float] = None,
+    ) -> float:
+        rate = cost_per_million
+        if rate is None:
+            rate = cls.PRICING.get(model, cls.PRICING["claude-3-5-sonnet"])["cost_per_m"]
+        if not math.isfinite(rate) or rate < 0:
+            raise ValueError("cost_per_million must be a finite, non-negative number")
         return (tokens / 1_000_000.0) * rate
 
 
@@ -105,8 +114,8 @@ class SecretScrubber:
     """
     RULES = [
         ("GITHUB_TOKEN", re.compile(r'\b(gh[pousr]_[A-Za-z0-9_]{36,}|github_pat_[A-Za-z0-9_]{82})\b')),
-        ("OPENAI_KEY", re.compile(r'\b(sk-(?:proj-)?[A-Za-z0-9_\-]{40,})\b')),
         ("ANTHROPIC_KEY", re.compile(r'\b(sk-ant-[A-Za-z0-9_\-]{40,})\b')),
+        ("OPENAI_KEY", re.compile(r'\b(sk-(?!ant-)(?:proj-)?[A-Za-z0-9_\-]{40,})\b')),
         ("HUGGINGFACE_TOKEN", re.compile(r'\b(hf_[A-Za-z0-9]{34,})\b')),
         ("STRIPE_KEY", re.compile(r'\b([rs]k_(?:live|test)_[A-Za-z0-9]{24,})\b')),
         ("AWS_KEY_ID", re.compile(r'\b(AKIA[0-9A-Z]{16})\b')),
@@ -243,11 +252,55 @@ class PythonSkeletonizer:
     Omites: function/method implementation bodies, replacing them with '...'
     """
     @staticmethod
+    def _source_fallback(source: str, tree: ast.Module, stub_level: str) -> str:
+        """Stub function bodies without ast.unparse (available only from Python 3.9)."""
+        lines = source.splitlines()
+        edits = []
+
+        class FunctionCollector(ast.NodeVisitor):
+            def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                self._collect(node)
+
+            def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+                self._collect(node)
+
+            def _collect(self, node: Any) -> None:
+                if node.body:
+                    value = getattr(node.body[0], "value", None)
+                    is_docstring = isinstance(node.body[0], ast.Expr) and isinstance(value, ast.Constant) and isinstance(value.value, str)
+                    doc = node.body[0] if is_docstring else None
+                    body_start = node.body[0].lineno - 1
+                    body_end = getattr(node, "end_lineno", node.body[-1].lineno) - 1
+                    if body_start == node.lineno - 1:
+                        # One-line suites (``def f(): return x``) share their header line.
+                        raw_line = lines[body_start].encode("utf-8")
+                        prefix = raw_line[:node.body[0].col_offset].decode("utf-8", errors="ignore")
+                        replacement = [prefix + "..."]
+                    elif doc is not None and stub_level != "minimal":
+                        keep_end = getattr(doc, "end_lineno", doc.lineno) - 1
+                        replacement = lines[body_start:keep_end + 1]
+                        indent = lines[body_start][:len(lines[body_start]) - len(lines[body_start].lstrip())]
+                        replacement.append(indent + "...")
+                    else:
+                        indent = lines[body_start][:len(lines[body_start]) - len(lines[body_start].lstrip())]
+                        replacement = [indent + "..."]
+                    edits.append((body_start, body_end, replacement))
+                self.generic_visit(node)
+
+        FunctionCollector().visit(tree)
+        for first, last, replacement in sorted(edits, key=lambda item: item[0], reverse=True):
+            lines[first:last + 1] = replacement
+        return "\n".join(lines)
+
+    @staticmethod
     def skeletonize(source: str, stub_level: str = "standard") -> str:
         try:
             tree = ast.parse(source)
         except SyntaxError:
             return GenericCompactor.compact(source, lang="python")
+
+        if not callable(getattr(ast, "unparse", None)):
+            return PythonSkeletonizer._source_fallback(source, tree, stub_level)
 
         class Transformer(ast.NodeTransformer):
             def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
@@ -274,7 +327,10 @@ class PythonSkeletonizer:
         ast.fix_missing_locations(transformed)
 
         try:
-            unparsed = ast.unparse(transformed)
+            unparse = getattr(ast, "unparse", None)
+            if unparse is None:
+                return PythonSkeletonizer._source_fallback(source, tree, stub_level)
+            unparsed = unparse(transformed)
             lines = []
             for line in unparsed.splitlines():
                 if line.strip() == "...":
@@ -446,33 +502,25 @@ class GenericCompactor:
 # ==============================================================================
 
 class IgnoreEngine:
-    """
-    Hierarchical gitignore and exclusion rules.
-    Respects .gitignore, user rules, and built-in binary/bloat filters.
-    """
+    """Small, dependency-free ignore engine with scoped .gitignore rules."""
     DEFAULT_IGNORED_DIRS = {
-        ".git", ".svn", ".hg", ".idea", ".vscode",
-        "node_modules", "bower_components",
+        ".git", ".svn", ".hg", "node_modules", "bower_components",
         "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox",
-        "venv", ".venv", "env", ".env", "virtualenv",
-        "dist", "build", "out", "target", ".next", ".nuxt", ".output",
-        ".parcel-cache", ".turbo", ".svelte-kit", "coverage", ".coverage",
-        "vendor", "Pods", ".gradle", "bin", "obj"
+        "venv", ".venv", "virtualenv", "dist", "build", "out", "target",
+        ".next", ".nuxt", ".output", ".parcel-cache", ".turbo", ".svelte-kit",
+        "coverage", "vendor", "Pods", ".gradle", "bin", "obj"
     }
-
     DEFAULT_IGNORED_EXTS = {
         ".exe", ".dll", ".so", ".dylib", ".bin", ".apk", ".aab", ".ipa", ".class",
-        ".pyc", ".pyo", ".pyd", ".o", ".a", ".obj",
-        ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar", ".jar", ".war",
-        ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".webp", ".mp3", ".mp4",
-        ".wav", ".ogg", ".pdf", ".docx", ".xlsx", ".pptx", ".ttf", ".woff", ".woff2",
-        ".lock", ".sqlite", ".sqlite3", ".db", ".log"
+        ".pyc", ".pyo", ".pyd", ".o", ".a", ".obj", ".zip", ".tar", ".gz", ".bz2",
+        ".xz", ".7z", ".rar", ".jar", ".war", ".png", ".jpg", ".jpeg", ".gif", ".ico",
+        ".svg", ".webp", ".mp3", ".mp4", ".wav", ".ogg", ".pdf", ".docx", ".xlsx",
+        ".pptx", ".ttf", ".woff", ".woff2", ".lock", ".sqlite", ".sqlite3", ".db", ".log"
     }
-
     DEFAULT_IGNORED_FILES = {
-        "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "Cargo.lock",
-        "composer.lock", "poetry.lock", "Pipfile.lock", "Gemfile.lock",
-        ".DS_Store", "Thumbs.db", ".env.local", ".env.production"
+        "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "Cargo.lock", "composer.lock",
+        "poetry.lock", "Pipfile.lock", "Gemfile.lock", ".DS_Store", "Thumbs.db",
+        ".env", ".env.local", ".env.production", ".env.development"
     }
 
     def __init__(self, root: Path, custom_ignores: Optional[List[str]] = None):
@@ -482,67 +530,86 @@ class IgnoreEngine:
         self._load_all_gitignores()
 
     def _load_all_gitignores(self) -> None:
-        for gitignore_path in self.root.rglob(".gitignore"):
+        # Avoid descending into known generated/dependency trees while finding nested rules.
+        for base, dirs, files in os.walk(self.root):
+            dirs[:] = sorted(d for d in dirs if d not in self.DEFAULT_IGNORED_DIRS)
+            if ".gitignore" not in files:
+                continue
+            ignore_path = Path(base) / ".gitignore"
             try:
-                base_dir = gitignore_path.parent
-                with open(gitignore_path, "r", encoding="utf-8", errors="ignore") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line or line.startswith("#"):
+                with open(ignore_path, "r", encoding="utf-8", errors="replace") as stream:
+                    for raw in stream:
+                        line = raw.rstrip("\r\n")
+                        if not line or line.lstrip().startswith("#"):
                             continue
-                        is_negation = line.startswith("!")
-                        pattern = line[1:] if is_negation else line
-                        self.gitignore_rules.append((base_dir, pattern, is_negation))
-            except Exception:
-                pass
-
-    def is_ignored(self, path: Path) -> bool:
-        resolved = path.resolve()
-        try:
-            rel_path = resolved.relative_to(self.root)
-        except ValueError:
-            return True
-
-        parts = rel_path.parts
-        for part in parts[:-1]:
-            if part in self.DEFAULT_IGNORED_DIRS or part.startswith("."):
-                return True
-
-        filename = path.name
-        if filename in self.DEFAULT_IGNORED_FILES:
-            return True
-
-        suffix = path.suffix.lower()
-        if suffix in self.DEFAULT_IGNORED_EXTS:
-            return True
-
-        rel_str = str(rel_path).replace("\\", "/")
-        for pat in self.custom_ignores:
-            if fnmatch.fnmatch(rel_str, pat) or fnmatch.fnmatch(filename, pat):
-                return True
-
-        ignored_by_git = False
-        for base_dir, pat, is_neg in self.gitignore_rules:
-            try:
-                rel_to_base = str(resolved.relative_to(base_dir)).replace("\\", "/")
-            except ValueError:
+                        # Backslash escapes a leading # or ! in gitignore syntax.
+                        escaped_marker = line.startswith(r"\!") or line.startswith(r"\#")
+                        if escaped_marker:
+                            line = line[1:]
+                        negated = line.startswith("!") and not escaped_marker
+                        pattern = line[1:] if negated else line
+                        if pattern:
+                            self.gitignore_rules.append((Path(base).resolve(), pattern, negated))
+            except (OSError, UnicodeError):
                 continue
 
-            match = False
-            if pat.endswith("/"):
-                if path.is_dir() and fnmatch.fnmatch(rel_to_base, pat.rstrip("/")):
-                    match = True
-            elif "/" in pat:
-                if fnmatch.fnmatch(rel_to_base, pat.lstrip("/")):
-                    match = True
-            else:
-                if fnmatch.fnmatch(filename, pat):
-                    match = True
+    @staticmethod
+    def _glob_match(value: str, pattern: str) -> bool:
+        # fnmatch supports the common gitignore glob forms (including **).
+        return fnmatch.fnmatchcase(value, pattern)
 
-            if match:
-                ignored_by_git = not is_neg
+    def _rule_matches(self, path: Path, base: Path, pattern: str) -> bool:
+        try:
+            rel = path.relative_to(base).as_posix()
+        except ValueError:
+            return False
+        directory_only = pattern.endswith("/")
+        pattern = pattern.rstrip("/")
+        anchored = pattern.startswith("/")
+        pattern = pattern.lstrip("/")
+        has_slash = "/" in pattern
+        candidates = [rel]
+        # Directory rules apply to that directory and all descendants.
+        if directory_only or path.is_dir():
+            parts = rel.split("/")
+            candidates.extend("/".join(parts[:i]) for i in range(1, len(parts)))
+        elif "/" in rel:
+            parts = rel.split("/")
+            candidates.extend("/".join(parts[:i]) for i in range(1, len(parts)))
+        for candidate in candidates:
+            if has_slash or anchored:
+                if self._glob_match(candidate, pattern):
+                    return True
+            elif self._glob_match(candidate.rsplit("/", 1)[-1], pattern):
+                return True
+        return False
 
-        return ignored_by_git
+    def is_ignored(self, path: Path) -> bool:
+        try:
+            resolved = path.resolve()
+            rel = resolved.relative_to(self.root)
+        except (ValueError, OSError):
+            return True
+        parts = rel.parts
+        if any(part in self.DEFAULT_IGNORED_DIRS for part in parts[:-1]):
+            return True
+        if (path.name in self.DEFAULT_IGNORED_FILES or path.name.startswith(".env.")
+                or path.suffix.lower() in self.DEFAULT_IGNORED_EXTS):
+            return True
+        # Never follow symlinks out of the scanned tree.
+        if path.is_symlink():
+            return True
+        rel_posix = rel.as_posix()
+        if any(self._glob_match(rel_posix, pat) or self._glob_match(path.name, pat)
+               for pat in self.custom_ignores):
+            return True
+
+        ignored = False
+        # Root rules precede nested rules, matching git's last-matching-rule behavior.
+        for base, pattern, negated in sorted(self.gitignore_rules, key=lambda rule: len(rule[0].parts)):
+            if self._rule_matches(resolved, base, pattern):
+                ignored = not negated
+        return ignored
 
 
 # ==============================================================================
@@ -563,6 +630,7 @@ class ProcessedFile:
     compressed_content: str
     symbols: List[str] = field(default_factory=list)
     is_focused: bool = False
+    included: bool = True
 
     @property
     def reduction_pct(self) -> float:
@@ -583,6 +651,7 @@ class RepoSummary:
     cost_original_usd: float
     cost_compressed_usd: float
     files: List[ProcessedFile] = field(default_factory=list)
+    price_per_million_usd: float = 3.0
 
     @property
     def total_reduction_pct(self) -> float:
@@ -629,6 +698,7 @@ class TokenDietEngine:
         max_file_size_kb: int = 512,
         scrub_secrets: bool = True,
         token_budget: Optional[int] = None,
+        price_per_million: float = 3.0,
     ):
         self.root = root.resolve()
         self.default_mode = mode
@@ -637,6 +707,9 @@ class TokenDietEngine:
         self.max_file_size_bytes = max_file_size_kb * 1024
         self.scrub_secrets = scrub_secrets
         self.token_budget = token_budget
+        if not math.isfinite(price_per_million) or price_per_million < 0:
+            raise ValueError("price_per_million must be a finite, non-negative number")
+        self.price_per_million = price_per_million
 
     def detect_language(self, path: Path) -> str:
         ext = path.suffix.lower()
@@ -718,8 +791,10 @@ class TokenDietEngine:
         file_mode = mode_override or ("full" if is_focus else self.default_mode)
 
         lang = self.detect_language(file_path)
-        compressed, redacted = self.process_file_content(content, lang, file_mode)
-        symbols = self.extract_symbols(content, lang)
+        # Keep only scrubbed source in the summary; this object is also served to the local UI.
+        safe_content, redacted = SecretScrubber.scrub(content) if self.scrub_secrets else (content, 0)
+        compressed, _ = self.process_file_content(safe_content, lang, file_mode)
+        symbols = self.extract_symbols(safe_content, lang)
 
         orig_tokens = TokenEstimator.estimate(content)
         comp_tokens = TokenEstimator.estimate(compressed)
@@ -733,7 +808,7 @@ class TokenDietEngine:
             original_tokens=orig_tokens,
             compressed_tokens=comp_tokens,
             secrets_redacted=redacted,
-            original_content=content,
+            original_content=safe_content,
             compressed_content=compressed,
             symbols=symbols,
             is_focused=is_focus,
@@ -777,9 +852,10 @@ class TokenDietEngine:
             total_original_tokens=orig_tokens,
             total_compressed_tokens=comp_tokens,
             total_secrets_redacted=redacted,
-            cost_original_usd=TokenEstimator.calculate_cost(orig_tokens),
-            cost_compressed_usd=TokenEstimator.calculate_cost(comp_tokens),
+            cost_original_usd=TokenEstimator.calculate_cost(orig_tokens, cost_per_million=self.price_per_million),
+            cost_compressed_usd=TokenEstimator.calculate_cost(comp_tokens, cost_per_million=self.price_per_million),
             files=processed_files,
+            price_per_million_usd=self.price_per_million,
         )
 
     def _optimize_for_budget(self, files: List[ProcessedFile], budget: int) -> List[ProcessedFile]:
@@ -851,40 +927,85 @@ class PromptFormatter:
                     lines.append(f"    - {sym}")
         return "\n".join(lines) if lines else "(No exported symbols detected)"
 
+    @staticmethod
+    def _selected_summary(summary: RepoSummary) -> RepoSummary:
+        """Build output totals from only the files currently included in the prompt."""
+        files = [f for f in summary.files if f.included]
+        original_tokens = sum(f.original_tokens for f in files)
+        compressed_tokens = sum(f.compressed_tokens for f in files)
+        return RepoSummary(
+            root_path=summary.root_path,
+            total_files=len(files),
+            total_original_lines=sum(f.original_lines for f in files),
+            total_compressed_lines=sum(f.compressed_lines for f in files),
+            total_original_tokens=original_tokens,
+            total_compressed_tokens=compressed_tokens,
+            total_secrets_redacted=sum(f.secrets_redacted for f in files),
+            cost_original_usd=TokenEstimator.calculate_cost(
+                original_tokens, cost_per_million=summary.price_per_million_usd
+            ),
+            cost_compressed_usd=TokenEstimator.calculate_cost(
+                compressed_tokens, cost_per_million=summary.price_per_million_usd
+            ),
+            files=files,
+            price_per_million_usd=summary.price_per_million_usd,
+        )
+
+    @staticmethod
+    def _xml_safe(value: str) -> str:
+        """Remove characters forbidden by XML 1.0 while preserving legal whitespace."""
+        def is_xml_char(ch: str) -> bool:
+            code = ord(ch)
+            return (code in (9, 10, 13) or 0x20 <= code <= 0xD7FF
+                    or 0xE000 <= code <= 0xFFFD or 0x10000 <= code <= 0x10FFFF)
+        return "".join(ch for ch in value if is_xml_char(ch))
+
     @classmethod
     def to_xml(cls, summary: RepoSummary, include_repomap: bool = True) -> str:
+        summary = cls._selected_summary(summary)
         tree_str = cls.build_ascii_tree([f.path for f in summary.files])
-        out = []
-        out.append("<codebase>")
-        out.append(f'  <metadata total_files="{summary.total_files}" original_tokens="{summary.total_original_tokens:,}" compressed_tokens="{summary.total_compressed_tokens:,}" savings="{summary.total_reduction_pct:.1f}%">')
+        out = ["<codebase>"]
+        out.append(
+            "  <metadata total_files={} original_tokens={} compressed_tokens={} savings={}>".format(
+                xml_quoteattr(str(summary.total_files)),
+                xml_quoteattr(str(summary.total_original_tokens)),
+                xml_quoteattr(str(summary.total_compressed_tokens)),
+                xml_quoteattr("{:.1f}%".format(summary.total_reduction_pct)),
+            )
+        )
         out.append("    <directory_tree>")
-        out.append(tree_str)
+        out.append(xml_escape(cls._xml_safe(tree_str)))
         out.append("    </directory_tree>")
-
         if include_repomap:
-            repomap = cls.build_repomap(summary.files)
             out.append("    <symbol_map>")
-            out.append(repomap)
+            out.append(xml_escape(cls._xml_safe(cls.build_repomap(summary.files))))
             out.append("    </symbol_map>")
-
-        out.append("  </metadata>\n")
-
+        out.append("  </metadata>")
         for f in summary.files:
-            focus_attr = ' focus="true"' if f.is_focused else ''
-            out.append(f'  <file path="{f.path}" language="{f.language}" mode="{f.mode}" tokens="{f.compressed_tokens}"{focus_attr}>')
-            out.append(f.compressed_content)
-            out.append("  </file>\n")
-
+            attrs = [
+                "path={}".format(xml_quoteattr(cls._xml_safe(f.path))),
+                "language={}".format(xml_quoteattr(cls._xml_safe(f.language))),
+                "mode={}".format(xml_quoteattr(f.mode)),
+                "tokens={}".format(xml_quoteattr(str(f.compressed_tokens))),
+            ]
+            if f.is_focused:
+                attrs.append('focus="true"')
+            # XML 1.0 disallows most C0 controls; remove them without touching tabs/newlines.
+            content = cls._xml_safe(f.compressed_content)
+            out.append("  <file {}>".format(" ".join(attrs)))
+            out.append(xml_escape(content))
+            out.append("  </file>")
         out.append("</codebase>")
         return "\n".join(out)
 
     @classmethod
     def to_markdown(cls, summary: RepoSummary, include_repomap: bool = True) -> str:
+        summary = cls._selected_summary(summary)
         tree_str = cls.build_ascii_tree([f.path for f in summary.files])
         out = []
         out.append(f"# Codebase Context: `{Path(summary.root_path).name}`")
         out.append(f"> 🧊 Compressed with **TokenDiet**: **{summary.total_original_tokens:,}** tokens → **{summary.total_compressed_tokens:,}** tokens (**{summary.total_reduction_pct:.1f}% reduction**).")
-        out.append(f"> Saved approx **${summary.cost_saved_usd:.3f}** per prompt on Claude 3.5 Sonnet.\n")
+        out.append(f"> Illustrative cost delta: **${summary.cost_saved_usd:.3f}** at **${summary.price_per_million_usd:.2f}/1M input tokens**. Update this rate for your provider.\n")
         out.append("## Repository Tree\n```text")
         out.append(tree_str)
         out.append("```\n")
@@ -898,14 +1019,16 @@ class PromptFormatter:
         for f in summary.files:
             tag = " [FOCUS]" if f.is_focused else f" [{f.mode}]"
             out.append(f"### `{f.path}`{tag}")
-            out.append(f"```{f.language}")
+            fence = "`" * max(3, max((len(m.group(0)) for m in re.finditer(r"`+", f.compressed_content)), default=0) + 1)
+            out.append(f"{fence}{f.language}")
             out.append(f.compressed_content)
-            out.append("```\n")
+            out.append(f"{fence}\n")
 
         return "\n".join(out)
 
     @classmethod
     def to_json(cls, summary: RepoSummary) -> str:
+        summary = cls._selected_summary(summary)
         data = {
             "root": summary.root_path,
             "total_files": summary.total_files,
@@ -913,6 +1036,7 @@ class PromptFormatter:
             "compressed_tokens": summary.total_compressed_tokens,
             "savings_percent": round(summary.total_reduction_pct, 2),
             "estimated_cost_saved_usd": round(summary.cost_saved_usd, 4),
+            "reference_price_per_million_usd": summary.price_per_million_usd,
             "symbols": {f.path: f.symbols for f in summary.files if f.symbols},
             "files": [
                 {
@@ -1133,6 +1257,7 @@ button.btn-primary:hover { background: #2ea043; }
   font-size: 0.75rem;
   padding: 2px 4px;
 }
+.include-toggle { accent-color: var(--accent); flex: 0 0 auto; }
 .content-area {
   flex: 1;
   display: flex;
@@ -1209,7 +1334,7 @@ pre {
 <header>
   <div class="brand">
     <span>🧊 TokenDiet</span>
-    <span style="font-size: 0.75rem; color: var(--text-muted); font-weight: normal;">v1.1.0</span>
+    <span style="font-size: 0.75rem; color: var(--text-muted); font-weight: normal;">v1.2.0</span>
   </div>
   <div class="stats-bar">
     <div class="stat-pill">
@@ -1246,6 +1371,10 @@ pre {
         <button style="flex:1; font-size:0.75rem;" onclick="setAllMode('full')">All Full</button>
         <button style="flex:1; font-size:0.75rem;" onclick="setAllMode('compact')">All Compact</button>
       </div>
+      <div style="display: flex; gap: 6px; margin-top: 6px;">
+        <button style="flex:1; font-size:0.75rem;" onclick="setAllIncluded(true)">Include all files</button>
+        <button style="flex:1; font-size:0.75rem;" onclick="setAllIncluded(false)">Clear selection</button>
+      </div>
     </div>
     <ul class="file-list" id="file-list"></ul>
   </div>
@@ -1261,7 +1390,7 @@ pre {
     <div class="diff-container">
       <div class="pane">
         <div class="pane-title">
-          <span>ORIGINAL</span>
+          <span>SOURCE PREVIEW · SECRETS REDACTED</span>
           <span id="orig-tokens"></span>
         </div>
         <pre id="orig-code">Select a file from the left sidebar to preview comparison.</pre>
@@ -1297,15 +1426,18 @@ async function loadData() {
 }
 
 function updateStats() {
-  let origTot = 0, compTot = 0;
+  let origTot = 0, compTot = 0, selectedCount = 0;
   repoData.files.forEach(f => {
+    if (f.included === false) return;
+    selectedCount += 1;
     origTot += f.original_tokens;
     compTot += f.compressed_tokens;
   });
   const savedPct = origTot > 0 ? (((origTot - compTot) / origTot) * 100).toFixed(1) : 0;
-  const costSaved = ((origTot - compTot) / 1000000 * 3.0).toFixed(3);
+  const referenceRate = Number(repoData.price_per_million_usd ?? 3.0);
+  const costSaved = ((origTot - compTot) / 1000000 * referenceRate).toFixed(3);
 
-  document.getElementById('stat-files').innerText = repoData.files.length;
+  document.getElementById('stat-files').innerText = selectedCount + ' / ' + repoData.files.length;
   document.getElementById('stat-orig').innerText = origTot.toLocaleString() + ' tok';
   document.getElementById('stat-comp').innerText = compTot.toLocaleString() + ' tok';
   document.getElementById('stat-saved').innerText = savedPct + '%';
@@ -1315,30 +1447,41 @@ function updateStats() {
 function renderFileList() {
   const list = document.getElementById('file-list');
   const query = document.getElementById('search').value.toLowerCase();
-  list.innerHTML = '';
-
+  list.replaceChildren();
   repoData.files.forEach((f, idx) => {
     if (query && !f.path.toLowerCase().includes(query)) return;
-
     const li = document.createElement('li');
     li.className = 'file-item' + (idx === activeIndex ? ' active' : '');
-    li.onclick = (e) => {
-      if (e.target.tagName !== 'SELECT') selectFile(idx);
-    };
-
+    li.addEventListener('click', (event) => {
+      if (event.target.tagName !== 'SELECT' && event.target.type !== 'checkbox') selectFile(idx);
+    });
+    const include = document.createElement('input');
+    include.type = 'checkbox';
+    include.className = 'include-toggle';
+    include.checked = f.included !== false;
+    include.setAttribute('aria-label', 'Include ' + f.path + ' in prompt');
+    include.addEventListener('change', () => changeIncluded(f.path, include.checked));
+    const info = document.createElement('div');
+    info.className = 'file-info';
+    const path = document.createElement('span');
+    path.className = 'file-path';
+    path.textContent = f.path;
+    const meta = document.createElement('span');
+    meta.className = 'file-meta';
     const reduction = f.reduction_pct ? f.reduction_pct.toFixed(0) : 0;
-
-    li.innerHTML = `
-      <div class="file-info">
-        <span class="file-path">${f.path}</span>
-        <span class="file-meta">${f.compressed_tokens.toLocaleString()} tok (${reduction}% saved)</span>
-      </div>
-      <select class="file-mode-select" onchange="changeMode('${f.path}', this.value, ${idx})">
-        <option value="skeleton" ${f.mode === 'skeleton' ? 'selected' : ''}>Skeleton</option>
-        <option value="compact" ${f.mode === 'compact' ? 'selected' : ''}>Compact</option>
-        <option value="full" ${f.mode === 'full' ? 'selected' : ''}>Full</option>
-      </select>
-    `;
+    meta.textContent = `${f.compressed_tokens.toLocaleString()} tok (${reduction}% saved)`;
+    info.append(path, meta);
+    const select = document.createElement('select');
+    select.className = 'file-mode-select';
+    [['skeleton', 'Skeleton'], ['compact', 'Compact'], ['full', 'Full']].forEach(([value, label]) => {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = label;
+      option.selected = f.mode === value;
+      select.appendChild(option);
+    });
+    select.addEventListener('change', () => changeMode(f.path, select.value, idx));
+    li.append(include, info, select);
     list.appendChild(li);
   });
 }
@@ -1361,7 +1504,13 @@ function selectFile(idx) {
   const symList = document.getElementById('symbol-list');
   if (f.symbols && f.symbols.length > 0) {
     symBar.style.display = 'block';
-    symList.innerHTML = f.symbols.map(s => `<span class="symbol-tag">${s}</span>`).join('');
+    symList.replaceChildren();
+    f.symbols.forEach(symbol => {
+      const tag = document.createElement('span');
+      tag.className = 'symbol-tag';
+      tag.textContent = symbol;
+      symList.appendChild(tag);
+    });
   } else {
     symBar.style.display = 'none';
   }
@@ -1397,6 +1546,30 @@ async function setAllMode(mode) {
   updateStats();
   renderFileList();
   selectFile(activeIndex);
+}
+
+async function changeIncluded(path, included) {
+  const res = await fetch('/api/set_included', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({path: path, included: included})
+  });
+  if (!res.ok) { showToast('Could not update file selection'); return; }
+  repoData = await res.json();
+  updateStats();
+  renderFileList();
+}
+
+async function setAllIncluded(included) {
+  const res = await fetch('/api/set_all_included', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({included: included})
+  });
+  if (!res.ok) { showToast('Could not update file selection'); return; }
+  repoData = await res.json();
+  updateStats();
+  renderFileList();
 }
 
 async function copyPrompt() {
@@ -1436,6 +1609,18 @@ class WebServerHandler(http.server.SimpleHTTPRequestHandler):
     summary: RepoSummary
     engine: TokenDietEngine
 
+    def send_scan_data(self) -> None:
+        data = {
+            "root": self.summary.root_path,
+            "total_files": self.summary.total_files,
+            "price_per_million_usd": self.summary.price_per_million_usd,
+            "files": [asdict(f) for f in self.summary.files],
+        }
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(json.dumps(data, ensure_ascii=False).encode("utf-8"))
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/":
@@ -1446,20 +1631,15 @@ class WebServerHandler(http.server.SimpleHTTPRequestHandler):
             return
 
         if parsed.path == "/api/scan":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.end_headers()
-            data = {
-                "root": self.summary.root_path,
-                "total_files": self.summary.total_files,
-                "files": [asdict(f) for f in self.summary.files]
-            }
-            self.wfile.write(json.dumps(data, ensure_ascii=False).encode("utf-8"))
+            self.send_scan_data()
             return
 
         if parsed.path == "/api/prompt":
             qs = urllib.parse.parse_qs(parsed.query)
             fmt = qs.get("format", ["xml"])[0]
+            if fmt not in ("xml", "markdown", "json"):
+                self.send_error(400, "Invalid format")
+                return
             if fmt == "markdown":
                 prompt = PromptFormatter.to_markdown(self.summary)
             elif fmt == "json":
@@ -1478,16 +1658,30 @@ class WebServerHandler(http.server.SimpleHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
-        content_len = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(content_len).decode("utf-8")
-        payload = json.loads(body) if body else {}
+        try:
+            content_len = int(self.headers.get("Content-Length", 0))
+            if content_len < 0 or content_len > 65536:
+                self.send_error(413, "Request too large")
+                return
+            body = self.rfile.read(content_len).decode("utf-8")
+            payload = json.loads(body) if body else {}
+            if not isinstance(payload, dict):
+                self.send_error(400, "JSON object required")
+                return
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            self.send_error(400, "Invalid JSON request")
+            return
 
         if parsed.path == "/api/update_file":
             path = payload.get("path")
             new_mode = payload.get("mode", "skeleton")
+            if new_mode not in ("skeleton", "compact", "full"):
+                self.send_error(400, "Invalid mode")
+                return
             for i, f in enumerate(self.summary.files):
                 if f.path == path:
-                    compressed, redacted = self.engine.process_file_content(f.original_content, f.language, new_mode)
+                    compressed, _ = self.engine.process_file_content(f.original_content, f.language, new_mode)
+                    redacted = f.secrets_redacted
                     f.mode = new_mode
                     f.compressed_content = compressed
                     f.compressed_lines = len(compressed.splitlines())
@@ -1503,23 +1697,43 @@ class WebServerHandler(http.server.SimpleHTTPRequestHandler):
 
         if parsed.path == "/api/set_all_modes":
             mode = payload.get("mode", "skeleton")
+            if mode not in ("skeleton", "compact", "full"):
+                self.send_error(400, "Invalid mode")
+                return
             for f in self.summary.files:
-                compressed, redacted = self.engine.process_file_content(f.original_content, f.language, mode)
+                compressed, _ = self.engine.process_file_content(f.original_content, f.language, mode)
+                redacted = f.secrets_redacted
                 f.mode = mode
                 f.compressed_content = compressed
                 f.compressed_lines = len(compressed.splitlines())
                 f.compressed_tokens = TokenEstimator.estimate(compressed)
                 f.secrets_redacted = redacted
 
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            data = {
-                "root": self.summary.root_path,
-                "total_files": self.summary.total_files,
-                "files": [asdict(f) for f in self.summary.files]
-            }
-            self.wfile.write(json.dumps(data).encode("utf-8"))
+            self.send_scan_data()
+            return
+
+        if parsed.path == "/api/set_included":
+            path = payload.get("path")
+            included = payload.get("included")
+            if not isinstance(path, str) or not isinstance(included, bool):
+                self.send_error(400, "Path and boolean included value required")
+                return
+            for f in self.summary.files:
+                if f.path == path:
+                    f.included = included
+                    self.send_scan_data()
+                    return
+            self.send_error(404, "File not found")
+            return
+
+        if parsed.path == "/api/set_all_included":
+            included = payload.get("included")
+            if not isinstance(included, bool):
+                self.send_error(400, "Boolean included value required")
+                return
+            for f in self.summary.files:
+                f.included = included
+            self.send_scan_data()
             return
 
         self.send_error(404, "Endpoint not found")
@@ -1528,40 +1742,48 @@ class WebServerHandler(http.server.SimpleHTTPRequestHandler):
         pass
 
 
-def start_web_server(engine: TokenDietEngine, summary: RepoSummary, port: int = 8080) -> None:
+def start_web_server(engine: TokenDietEngine, summary: RepoSummary, port: int = 8080, host: str = "127.0.0.1") -> None:
     handler = WebServerHandler
     handler.summary = summary
     handler.engine = engine
 
-    server = socketserver.TCPServer(("0.0.0.0", port), handler)
-    print(f"\n🚀 TokenDiet Web Visualizer live at http://0.0.0.0:{port}")
+    class ThreadingHTTPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+        allow_reuse_address = True
+        daemon_threads = True
+
+    server = ThreadingHTTPServer((host, port), handler)
+    print(f"\n🚀 TokenDiet Web Visualizer live at http://{host}:{port}")
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        print("⚠ Warning: non-loopback binding exposes repository context to the network.")
     print("Press Ctrl+C to stop.\n")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nStopping server...")
         server.shutdown()
+    finally:
+        server.server_close()
 
 
 # ==============================================================================
 # 9. CLI Interface & Terminal Reporting
 # ==============================================================================
 
-def print_summary_table(summary: RepoSummary) -> None:
-    print("\n" + "=" * 76)
-    print(f" 🧊 TokenDiet Context Compression Report")
-    print("=" * 76)
-    print(f" Root Directory:      {summary.root_path}")
-    print(f" Total Files:         {summary.total_files}")
-    print(f" Secrets Redacted:    {summary.total_secrets_redacted}")
-    print("-" * 76)
-    print(f" {'Metric':<24} | {'Before':<15} | {'After (Compressed)':<20} | {'Saved'}")
-    print("-" * 76)
-    print(f" {'Lines of Code':<24} | {summary.total_original_lines:<15,d} | {summary.total_compressed_lines:<20,d} | {100.0 - (summary.total_compressed_lines / max(1, summary.total_original_lines) * 100):.1f}%")
-    print(f" {'Estimated Tokens':<24} | {summary.total_original_tokens:<15,d} | {summary.total_compressed_tokens:<20,d} | {summary.total_reduction_pct:.1f}%")
-    print(f" {'Est. Cost (Claude 3.5)':<24} | ${summary.cost_original_usd:<14.3f} | ${summary.cost_compressed_usd:<19.3f} | -${summary.cost_saved_usd:.3f}")
-    print("=" * 76 + "\n")
-
+def print_summary_table(summary: RepoSummary, file=sys.stdout) -> None:
+    print("\n" + "=" * 76, file=file)
+    print(f" 🧊 TokenDiet Context Compression Report", file=file)
+    print("=" * 76, file=file)
+    print(f" Root Directory:      {summary.root_path}", file=file)
+    print(f" Total Files:         {summary.total_files}", file=file)
+    print(f" Secrets Redacted:    {summary.total_secrets_redacted}", file=file)
+    print(f" Reference Input:     ${summary.price_per_million_usd:.2f} per 1M tokens", file=file)
+    print("-" * 76, file=file)
+    print(f" {'Metric':<24} | {'Before':<15} | {'After (Compressed)':<20} | {'Saved'}", file=file)
+    print("-" * 76, file=file)
+    print(f" {'Lines of Code':<24} | {summary.total_original_lines:<15,d} | {summary.total_compressed_lines:<20,d} | {100.0 - (summary.total_compressed_lines / max(1, summary.total_original_lines) * 100):.1f}%", file=file)
+    print(f" {'Estimated Tokens':<24} | {summary.total_original_tokens:<15,d} | {summary.total_compressed_tokens:<20,d} | {summary.total_reduction_pct:.1f}%", file=file)
+    print(f" {'Illustrative Cost':<24} | ${summary.cost_original_usd:<14.3f} | ${summary.cost_compressed_usd:<19.3f} | -${summary.cost_saved_usd:.3f}", file=file)
+    print("=" * 76 + "\n", file=file)
 
 def run_secret_audit(root_path: Path, engine: TokenDietEngine) -> int:
     """Executes a standalone security scan for credentials across the repository."""
@@ -1573,12 +1795,20 @@ def run_secret_audit(root_path: Path, engine: TokenDietEngine) -> int:
         dirs[:] = [d for d in dirs if not engine.ignore_engine.is_ignored(Path(root) / d)]
         for file in sorted(files):
             p = Path(root) / file
-            if engine.ignore_engine.is_ignored(p):
+            ignored = engine.ignore_engine.is_ignored(p)
+            # Environment files are excluded from prompt bundles by default, but the
+            # dedicated security audit must inspect them when present.
+            if ignored and not (file == ".env" or file.startswith(".env.")):
                 continue
             try:
+                if p.stat().st_size > 1024 * 1024:
+                    continue
                 rel = str(p.relative_to(root_path)).replace("\\", "/")
-                with open(p, "r", encoding="utf-8", errors="ignore") as f:
-                    content = f.read()
+                with open(p, "rb") as f:
+                    raw = f.read()
+                if b"\x00" in raw:
+                    continue
+                content = raw.decode("utf-8", errors="replace")
                 findings = SecretScrubber.audit(content)
                 for f in findings:
                     findings_count += 1
@@ -1616,12 +1846,15 @@ Examples:
     parser.add_argument("--focus", type=str, default="",
                         help="Comma-separated globs of files to keep in FULL mode (e.g. 'src/core/*,api.py')")
     parser.add_argument("-b", "--budget", type=int, default=None,
-                        help="Target token budget: dynamically prunes and compresses until prompt fits under budget")
+                        help="Target token budget: compresses non-focused files progressively (estimate; may exceed)")
+    parser.add_argument("--price-per-million", type=float, default=3.0,
+                        help="Reference input price in USD per 1M tokens for cost estimates (default: 3.00)")
     parser.add_argument("-f", "--format", choices=["xml", "markdown", "json"], default="xml",
                         help="Output format: xml (Anthropic optimal, default), markdown, json")
     parser.add_argument("-o", "--output", type=str, default="", help="Save output prompt to file path")
     parser.add_argument("-c", "--clip", action="store_true", help="Copy generated prompt to system clipboard")
-    parser.add_argument("--serve", nargs="?", const=8080, type=int, help="Start zero-dep local Web UI visualizer on port (default: 8080)")
+    parser.add_argument("--serve", nargs="?", const=8080, type=int, help="Start local Web UI visualizer on port (default: 8080)")
+    parser.add_argument("--host", default="127.0.0.1", help="Visualizer bind address (default: 127.0.0.1; non-local hosts expose code)")
     parser.add_argument("--stats", action="store_true", help="Print summary table and token savings only")
     parser.add_argument("--tree-only", action="store_true", help="Print repository directory tree only")
     parser.add_argument("--repomap", action="store_true", help="Print architectural symbol map only")
@@ -1634,9 +1867,17 @@ Examples:
     args = parser.parse_args()
 
     root_path = Path(args.path).resolve()
-    if not root_path.exists():
-        print(f"Error: Path '{root_path}' does not exist.", file=sys.stderr)
+    if not root_path.exists() or not root_path.is_dir():
+        print(f"Error: Path '{root_path}' is not an existing directory.", file=sys.stderr)
         sys.exit(1)
+    if args.max_size <= 0:
+        parser.error("--max-size must be greater than zero")
+    if args.budget is not None and args.budget <= 0:
+        parser.error("--budget must be greater than zero")
+    if args.serve is not None and not 1 <= args.serve <= 65535:
+        parser.error("--serve port must be between 1 and 65535")
+    if not math.isfinite(args.price_per_million) or args.price_per_million < 0:
+        parser.error("--price-per-million must be a finite, non-negative number")
 
     focus_list = [f.strip() for f in args.focus.split(",") if f.strip()]
 
@@ -1647,17 +1888,29 @@ Examples:
         custom_ignores=args.ignore,
         max_file_size_kb=args.max_size,
         scrub_secrets=not args.no_scrub,
-        token_budget=args.budget
+        token_budget=args.budget,
+        price_per_million=args.price_per_million,
     )
+
+    if args.no_scrub:
+        print("Warning: secret scrubbing is disabled; generated context may contain credentials.", file=sys.stderr)
 
     if args.audit_secrets:
         code = run_secret_audit(root_path, engine)
         sys.exit(code)
 
     summary = engine.scan()
+    if args.budget is not None and summary.total_compressed_tokens > args.budget:
+        print(
+            "Warning: estimated file content remains above the requested budget "
+            "({:,} > {:,} tokens); wrappers/metadata add more.".format(
+                summary.total_compressed_tokens, args.budget
+            ),
+            file=sys.stderr,
+        )
 
     if args.serve is not None:
-        start_web_server(engine, summary, port=args.serve)
+        start_web_server(engine, summary, port=args.serve, host=args.host)
         return
 
     if args.tree_only:
@@ -1682,7 +1935,8 @@ Examples:
     else:
         output_text = PromptFormatter.to_xml(summary)
 
-    print_summary_table(summary)
+    # Keep machine-readable JSON clean on stdout; diagnostics stay on stderr.
+    print_summary_table(summary, file=sys.stderr if args.format == "json" and not args.output else sys.stdout)
 
     if args.output:
         out_path = Path(args.output).resolve()

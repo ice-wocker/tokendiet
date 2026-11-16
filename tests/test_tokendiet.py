@@ -62,6 +62,7 @@ class TestSecretScrubber(unittest.TestCase):
         self.assertNotIn("password123", scrubbed)
         self.assertIn("[REDACTED_SECRET:GITHUB_TOKEN]", scrubbed)
         self.assertIn("[REDACTED_SECRET:OPENAI_KEY]", scrubbed)
+        self.assertIn("[REDACTED_SECRET:ANTHROPIC_KEY]", scrubbed)
         self.assertIn("[REDACTED_SECRET:HUGGINGFACE_TOKEN]", scrubbed)
         self.assertIn("[REDACTED_SECRET:STRIPE_KEY]", scrubbed)
 

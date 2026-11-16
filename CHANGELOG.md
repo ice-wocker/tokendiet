@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.3.0 — 2026-11-16
+
+### Git-aware session context
+- Added `--changed [BASE]`: promote modified, staged, and untracked files to full context while keeping other included files in the selected compression mode.
+- Defaults to comparing against `HEAD`; accepts a branch, tag, or commit such as `origin/main`.
+- Handles nested repository roots and unusual filenames, and marks changed files in XML, Markdown, and JSON outputs.
+- Changed files are protected from budget downgrades; removed paths are naturally omitted because no working-tree content exists.
+
+### Quality
+- Added regression coverage for untracked/modified files, nested roots, spaces in paths, invalid Git bases, and output markers.
+- Test suite now contains 27 cases.
+
 ## 1.2.0 — 2026-11-16
 
 ### Security

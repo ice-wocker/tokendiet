@@ -33,7 +33,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 __banner__ = r"""
  _____     _              ____  _      _   
 |_   _|___| | _____ _ __ |  _ \(_) ___| |_ 
@@ -613,7 +613,56 @@ class IgnoreEngine:
 
 
 # ==============================================================================
-# 5. Core Repository Processor & Dynamic Budget Optimizer
+# 5. Git-aware change selection
+# ==============================================================================
+
+def git_changed_files(root: Path, base: str = "HEAD") -> Set[str]:
+    """Return changed tracked and untracked file paths under root.
+
+    Uses NUL-delimited Git output and never invokes a shell, so unusual filenames
+    are handled safely. Paths are returned relative to the requested root.
+    """
+    root = root.resolve()
+
+    def run_git_at(directory: Path, *args: str) -> bytes:
+        result = subprocess.run(
+            ["git", "-C", str(directory), *args],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+        )
+        if result.returncode:
+            detail = result.stderr.decode("utf-8", "replace").strip()
+            raise ValueError(detail or "git command failed")
+        return result.stdout
+
+    try:
+        repo_root = Path(run_git_at(root, "rev-parse", "--show-toplevel").decode().strip()).resolve()
+        prefix = root.relative_to(repo_root).as_posix()
+        # Run path-list commands from the repository root so all paths have a
+        # single, predictable origin even when root points at a nested package.
+        changed = run_git_at(repo_root, "diff", "--name-only", "-z", base, "--")
+        untracked = run_git_at(repo_root, "ls-files", "--others", "--exclude-standard", "-z")
+    except (ValueError, OSError) as exc:
+        raise ValueError("cannot read Git changes for {}: {}".format(root, exc)) from exc
+
+    root_prefix = prefix + "/" if prefix != "." else ""
+    paths: Set[str] = set()
+    for raw in changed.split(b"\0") + untracked.split(b"\0"):
+        if not raw:
+            continue
+        repo_rel = raw.decode("utf-8", "surrogateescape").replace("\\", "/")
+        if root_prefix:
+            if not repo_rel.startswith(root_prefix):
+                continue
+            rel = repo_rel[len(root_prefix):]
+        else:
+            rel = repo_rel
+        if (root / rel).is_file():
+            paths.add(rel)
+    return paths
+
+
+# ==============================================================================
+# 6. Core Repository Processor & Dynamic Budget Optimizer
 # ==============================================================================
 
 @dataclass
@@ -630,6 +679,7 @@ class ProcessedFile:
     compressed_content: str
     symbols: List[str] = field(default_factory=list)
     is_focused: bool = False
+    is_changed: bool = False
     included: bool = True
 
     @property
@@ -699,10 +749,12 @@ class TokenDietEngine:
         scrub_secrets: bool = True,
         token_budget: Optional[int] = None,
         price_per_million: float = 3.0,
+        changed_files: Optional[Set[str]] = None,
     ):
         self.root = root.resolve()
         self.default_mode = mode
         self.focus_patterns = focus_patterns or []
+        self.changed_files = set(changed_files or set())
         self.ignore_engine = IgnoreEngine(self.root, custom_ignores)
         self.max_file_size_bytes = max_file_size_kb * 1024
         self.scrub_secrets = scrub_secrets
@@ -787,8 +839,9 @@ class TokenDietEngine:
         except Exception:
             return None
 
+        is_changed = rel_path in self.changed_files
         is_focus = self.is_focused(rel_path)
-        file_mode = mode_override or ("full" if is_focus else self.default_mode)
+        file_mode = mode_override or ("full" if is_focus or is_changed else self.default_mode)
 
         lang = self.detect_language(file_path)
         # Keep only scrubbed source in the summary; this object is also served to the local UI.
@@ -812,6 +865,7 @@ class TokenDietEngine:
             compressed_content=compressed,
             symbols=symbols,
             is_focused=is_focus,
+            is_changed=is_changed,
         )
 
     def scan(self) -> RepoSummary:
@@ -865,7 +919,7 @@ class TokenDietEngine:
             return files
 
         # Tier 1: Convert non-focused code files from skeleton to compact/minimal stub
-        non_focused = [f for f in files if not f.is_focused]
+        non_focused = [f for f in files if not f.is_focused and not f.is_changed]
         # Sort by largest token footprint descending
         non_focused.sort(key=lambda f: f.compressed_tokens, reverse=True)
 
@@ -990,6 +1044,8 @@ class PromptFormatter:
             ]
             if f.is_focused:
                 attrs.append('focus="true"')
+            if f.is_changed:
+                attrs.append('changed="true"')
             # XML 1.0 disallows most C0 controls; remove them without touching tabs/newlines.
             content = cls._xml_safe(f.compressed_content)
             out.append("  <file {}>".format(" ".join(attrs)))
@@ -1017,7 +1073,7 @@ class PromptFormatter:
 
         out.append("## Files\n")
         for f in summary.files:
-            tag = " [FOCUS]" if f.is_focused else f" [{f.mode}]"
+            tag = " [CHANGED]" if f.is_changed else (" [FOCUS]" if f.is_focused else f" [{f.mode}]")
             out.append(f"### `{f.path}`{tag}")
             fence = "`" * max(3, max((len(m.group(0)) for m in re.finditer(r"`+", f.compressed_content)), default=0) + 1)
             out.append(f"{fence}{f.language}")
@@ -1047,6 +1103,7 @@ class PromptFormatter:
                     "compressed_tokens": f.compressed_tokens,
                     "reduction_percent": round(f.reduction_pct, 1),
                     "symbols": f.symbols,
+                    "changed": f.is_changed,
                     "content": f.compressed_content,
                 }
                 for f in summary.files
@@ -1334,7 +1391,7 @@ pre {
 <header>
   <div class="brand">
     <span>🧊 TokenDiet</span>
-    <span style="font-size: 0.75rem; color: var(--text-muted); font-weight: normal;">v1.2.0</span>
+    <span style="font-size: 0.75rem; color: var(--text-muted); font-weight: normal;">v1.3.0</span>
   </div>
   <div class="stats-bar">
     <div class="stat-pill">
@@ -1834,7 +1891,9 @@ Examples:
   python3 tokendiet.py .                         # Compress current directory (Anthropic XML to stdout)
   python3 tokendiet.py . -c                      # Compress and copy prompt directly to clipboard
   python3 tokendiet.py . --focus src/api.py      # Keep src/api.py full, skeletonize rest of repo
-  python3 tokendiet.py . --budget 8000           # Dynamically optimize codebase to fit within 8,000 tokens
+  python3 tokendiet.py . --changed               # Keep Git changes and untracked files full
+  python3 tokendiet.py . --changed origin/main   # Compare against a branch or commit
+  python3 tokendiet.py . --budget 8000           # Compress toward an estimated 8,000-token budget
   python3 tokendiet.py . --repomap               # Output architectural symbol map only
   python3 tokendiet.py . --audit-secrets         # Audit codebase for leaked credentials
   python3 tokendiet.py . --serve 8080            # Launch interactive browser visualizer & inspector
@@ -1845,6 +1904,8 @@ Examples:
                         help="Compression mode: skeleton (AST stubs, default), compact (strip blanks/comments), full")
     parser.add_argument("--focus", type=str, default="",
                         help="Comma-separated globs of files to keep in FULL mode (e.g. 'src/core/*,api.py')")
+    parser.add_argument("--changed", nargs="?", const="HEAD", default=None, metavar="BASE",
+                        help="Keep Git-changed and untracked files FULL (default comparison: HEAD)")
     parser.add_argument("-b", "--budget", type=int, default=None,
                         help="Target token budget: compresses non-focused files progressively (estimate; may exceed)")
     parser.add_argument("--price-per-million", type=float, default=3.0,
@@ -1880,6 +1941,12 @@ Examples:
         parser.error("--price-per-million must be a finite, non-negative number")
 
     focus_list = [f.strip() for f in args.focus.split(",") if f.strip()]
+    changed_paths: Set[str] = set()
+    if args.changed is not None:
+        try:
+            changed_paths = git_changed_files(root_path, args.changed)
+        except ValueError as exc:
+            parser.error(str(exc))
 
     engine = TokenDietEngine(
         root=root_path,
@@ -1890,6 +1957,7 @@ Examples:
         scrub_secrets=not args.no_scrub,
         token_budget=args.budget,
         price_per_million=args.price_per_million,
+        changed_files=changed_paths,
     )
 
     if args.no_scrub:

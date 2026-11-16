@@ -9,7 +9,7 @@
 [![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB?logo=python&logoColor=white)](https://python.org)
 [![Dependencies](https://img.shields.io/badge/Dependencies-0%20(Standard%20Library)-brightgreen)](#)
 [![Format](https://img.shields.io/badge/Prompt%20Format-Anthropic%20XML%20%7C%20Markdown-orange)](#)
-[![Tests](https://img.shields.io/badge/Tests-Passing%20(24%2F24)-brightgreen)](#)
+[![Tests](https://img.shields.io/badge/Tests-Passing%20(27%2F27)-brightgreen)](#)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 [English](#features) · [中文文档](#-为什么需要-tokendiet) · [快速开始](#quick-start) · [Web 看板](#-zero-dependency-web-visualizer) · [架构符号树](#-architectural-symbol-map)
@@ -20,14 +20,14 @@
 
 ## 💡 为什么需要 TokenDiet？
 
-当你使用 **Claude Code、Cursor、Windsurf、Aider** 或直接给 **Claude 3.5 Sonnet / GPT-4o / DeepSeek** 投喂整个代码库时，你会面临三大硬痛点：
+当你使用 **Claude Code、Cursor、Windsurf、Aider** 等工具处理完整代码库时，常会遇到三类上下文问题：
 
 1. **上下文冗余**：仓库里常有重复实现、生成物和与当前任务无关的细节，整库打包会挤占模型上下文。TokenDiet 提供压缩前后启发式估算；实际 Token 数与费用因模型、分词器和定价而异。
-2. **“大海捞针”与幻觉（Lost in the Middle）**：模型被成千上万行琐碎的 `for` 循环、内部实现逻辑淹没，反而抓不住模块间的关键架构、接口签名与数据流动，导致推理质量大幅劣化。
-3. **敏感凭据泄漏风险**：日常项目经常残留 `.env`、API Key、数据库密码、内网连接串，不慎打包直接发往公有云大模型。
+2. **实现细节过载**：大量与当前任务无关的代码可能遮住模块边界与依赖关系。压缩骨架提供另一种阅读视角，但不能保证模型推理质量。
+3. **敏感凭据泄漏风险**：源码可能残留 API Key、数据库密码、内网连接串，不慎打包会增加外发风险。TokenDiet 尝试脱敏常见模式，但并非完整的 secret scanner。
 
-**TokenDiet 给出极致优雅的解决方案：**
-> **核心思想**：大模型进行架构规划、代码审查、新增功能或集成调试时，**周边模块只需要「类型、签名、Docstring 与导出规范」**；只有你当前聚焦的文件才需要完整实现！
+**TokenDiet 的做法：**
+> 生成仓库树、符号索引与压缩后的文件上下文；对指定焦点文件保留完整实现，让使用者自行选择全局结构与局部细节的取舍。
 
 ---
 
@@ -40,9 +40,11 @@
   - **Python**：原生 `ast` 解析，保留装饰器、函数/类签名、完整类型注解与第一行 Docstring，剥离函数体并替换为 `...  # [implementation omitted]`。
   - **TypeScript / JavaScript / Go / Java / Rust / C++ / C# / Kotlin**：括号语法感知状态机，尽量保留常见接口（`interface`）、类型（`type`）、结构体（`struct`）、类头并折叠可识别的函数体；不是完整语言解析器，复杂语法可能无法正确分类。
 - 🗺️ **全局架构符号树 (Symbol Map)**：
-  - 自动提取并生成整个代码库的类名、导出函数、接口清单（`--repomap`），如 ctags 般精准，为大模型建立清晰全局索引。
+  - 从支持语言中提取可识别的类名、函数和接口线索（`--repomap`），帮助模型快速定位关键抽象；覆盖范围取决于语法规则。
 - 🎯 **聚焦模式 (Focus Mode)**：
   - `--focus src/api.py`：让匹配的文件以 `full` 模式保留，其余纳入扫描的文件按所选模式处理；搭配 `--stats` 在自己的仓库验证实际开销。
+- 🧭 **Git 会话上下文 (`--changed`)**：
+  - 以 `HEAD` 或指定分支/提交为基准，将已修改、暂存和未跟踪文件保留为完整内容，其他文件继续压缩；特别适合准备一次代码审查或 AI 编码会话。
 - 🎚️ **动态 Token 预算控制 (`--budget N`)**：
   - 输入预算后，优先保留焦点文件，再将非焦点文件从骨架降级为符号存根。预算基于启发式估算；若焦点文件或存根本身超过预算，仍可能超出目标。
 - 🛡️ **凭据风险降低与独立审计**：
@@ -79,13 +81,19 @@ python3 tokendiet.py . -c
 # 方式 C：聚焦指定文件（核心文件全量，其他文件骨架化）
 python3 tokendiet.py . --focus src/user_service.py -c
 
-# 方式 D：尝试压缩到目标 Token 预算（结果是启发式估算，可能超过目标）
+# 方式 D：Git 会话模式（变更与未跟踪文件全量，其余压缩）
+python3 tokendiet.py . --changed -c
+
+# 方式 E：相对主分支构建上下文
+python3 tokendiet.py . --changed origin/main -o review.xml
+
+# 方式 F：尝试压缩到目标 Token 预算（估算值，可能超过目标）
 python3 tokendiet.py . --budget 8000 -c
 
-# 方式 E：输出 Markdown 格式到文件
+# 方式 G：输出 Markdown 格式到文件
 python3 tokendiet.py . --format markdown -o context.md
 
-# 方式 F：项目凭据启发式审计（也检查 .env）
+# 方式 H：项目凭据启发式审计（也检查 .env）
 python3 tokendiet.py . --audit-secrets
 ```
 
@@ -160,10 +168,11 @@ python3 tokendiet.py . --serve 8080
 
 选项:
   -m, --mode            压缩模式: skeleton (AST 骨架, 默认) | compact (去空行/紧凑) | full (全量)
-  --focus               逗号分隔的文件通配符列表，保持 100% 全量展示 (例: "src/api.py,src/auth/*")
-  -b, --budget          目标 Token 预算配额: 按估算逐级压缩非焦点文件（可能超出）
+  --focus               逗号分隔的文件通配符列表，保持全量模式 (例: "src/api.py,src/auth/*")
+  --changed [BASE]       Git 会话模式：变更与未跟踪文件全量，默认比较 HEAD (例: origin/main)
+  -b, --budget          目标 Token 预算参考：逐级压缩非焦点文件（估算值，可能超出）
   --price-per-million   输入 Token 参考单价（USD / 1M；默认 3.00，可自定义）
-  -f, --format          输出提示词格式: xml (Anthropic 官方推荐格式, 默认) | markdown | json
+  -f, --format          输出结构格式: xml (默认) | markdown | json
   -o, --output          将提示词保存到指定文件路径 (例: -o prompt.xml)
   -c, --clip            直接将生成的提示词写入系统剪贴板 (免去复制粘贴)
   --serve [port]        启动本地 Web 看板 (默认端口: 8080，仅绑定 127.0.0.1)

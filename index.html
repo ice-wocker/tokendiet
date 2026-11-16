@@ -442,7 +442,7 @@ footer p {
   <nav class="site-nav">
     <a href="#top" class="brand-link">
       <span>TokenDiet 🧊</span>
-      <span class="brand-badge">v1.2.0</span>
+      <span class="brand-badge">v1.3.0</span>
     </a>
     <ul class="nav-links">
       <li><a href="#principles">设计原则</a></li>
@@ -468,7 +468,7 @@ footer p {
 
     <div class="metrics-strip">
       <div class="metric-item">
-        <span class="metric-number">21 项</span>
+        <span class="metric-number">27 项</span>
         <span class="metric-label">当前回归测试（Python 3.8–3.14）</span>
       </div>
       <div class="metric-item">
@@ -498,7 +498,7 @@ footer p {
       </article>
       <article class="feature-card">
         <h3>03 · 仓库感知与可控压缩</h3>
-        <p>尊重分层 .gitignore 与自定义排除规则。可聚焦指定路径，也可设置预算尝试逐级折叠；所有 Token 与预算均为启发式估计。</p>
+        <p>尊重分层 .gitignore 与自定义排除规则。支持 `--changed` 将改动和未跟踪文件保留为完整上下文；也可聚焦路径或设置预算。Token 数均为启发式估计。</p>
       </article>
     </div>
   </section>
@@ -593,14 +593,14 @@ def hash_password(password: str, salt: str = "salt123") -> str:
       <p class="section-subtitle">无需配置 Python 虚拟环境，直接处理并复制至剪贴板。</p>
     </div>
     <div class="terminal-shell">
-      <code>python3 tokendiet.py . --focus src/api.py -c</code>
+      <code>python3 tokendiet.py . --changed -c</code>
       <button type="button" class="btn-copy" onclick="copySnippet()">复制命令</button>
     </div>
   </section>
 </main>
 
 <footer>
-  <p>TokenDiet 🧊 · v1.2.0 · 零依赖，启发式估算</p>
+  <p>TokenDiet 🧊 · v1.3.0 · 零依赖，启发式估算</p>
   <p>遵循 MIT 开源许可协议 · 拒绝软件臃肿</p>
 </footer>
 
@@ -713,7 +713,7 @@ function calculateSavings() {
 calculateSavings();
 
 function copySnippet() {
-  navigator.clipboard.writeText('python3 tokendiet.py . --focus src/api.py -c').then(() => {
+  navigator.clipboard.writeText('python3 tokendiet.py . --changed -c').then(() => {
     alert('已复制安装运行命令到剪贴板！');
   });
 }

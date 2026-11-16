@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import tokendiet
-from tokendiet import IgnoreEngine, PromptFormatter, TokenDietEngine
+from tokendiet import IgnoreEngine, PromptFormatter, TokenDietEngine, git_changed_files
 
 
 class TestUpgrade(unittest.TestCase):
@@ -174,6 +174,71 @@ class TestUpgrade(unittest.TestCase):
         self.assertIn("path.textContent = f.path", html)
         self.assertIn("/api/set_included", html)
         self.assertIn("tag.textContent = symbol", html)
+
+    @staticmethod
+    def _git(root, *args):
+        subprocess.run(
+            ["git", "-C", str(root), *args], check=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+
+    def test_changed_and_untracked_files_are_full_and_marked(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._git(root, "init", "-q")
+            self._git(root, "config", "user.email", "test@example.invalid")
+            self._git(root, "config", "user.name", "TokenDiet Test")
+            (root / "changed.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+            (root / "stable.py").write_text("def stable():\n    return 2\n", encoding="utf-8")
+            self._git(root, "add", ".")
+            self._git(root, "commit", "-qm", "baseline")
+            (root / "changed.py").write_text("def value():\n    return 999\n", encoding="utf-8")
+            (root / "new file.py").write_text("def fresh():\n    return 3\n", encoding="utf-8")
+
+            changed = git_changed_files(root)
+            self.assertEqual(changed, {"changed.py", "new file.py"})
+            summary = TokenDietEngine(root, changed_files=changed).scan()
+            files = {item.path: item for item in summary.files}
+            self.assertEqual(files["changed.py"].mode, "full")
+            self.assertEqual(files["new file.py"].mode, "full")
+            self.assertEqual(files["stable.py"].mode, "skeleton")
+            self.assertTrue(files["changed.py"].is_changed)
+            self.assertIn('changed="true"', PromptFormatter.to_xml(summary))
+            self.assertIn("[CHANGED]", PromptFormatter.to_markdown(summary))
+            data = json.loads(PromptFormatter.to_json(summary))
+            changed_json = {item["path"]: item for item in data["files"]}
+            self.assertTrue(changed_json["new file.py"]["changed"])
+
+    def test_nested_git_root_scopes_changed_paths(self):
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp)
+            root = repo / "packages" / "app"
+            root.mkdir(parents=True)
+            outside = repo / "outside.py"
+            inside = root / "inside.py"
+            outside.write_text("x = 1\n", encoding="utf-8")
+            inside.write_text("x = 1\n", encoding="utf-8")
+            self._git(repo, "init", "-q")
+            self._git(repo, "config", "user.email", "test@example.invalid")
+            self._git(repo, "config", "user.name", "TokenDiet Test")
+            self._git(repo, "add", ".")
+            self._git(repo, "commit", "-qm", "baseline")
+            inside.write_text("x = 2\n", encoding="utf-8")
+            outside.write_text("x = 2\n", encoding="utf-8")
+            (root / "untracked.py").write_text("y = 1\n", encoding="utf-8")
+            self.assertEqual(git_changed_files(root), {"inside.py", "untracked.py"})
+
+    def test_changed_mode_requires_a_valid_git_base(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._git(root, "init", "-q")
+            self._git(root, "config", "user.email", "test@example.invalid")
+            self._git(root, "config", "user.name", "TokenDiet Test")
+            (root / "file.py").write_text("x = 1\n", encoding="utf-8")
+            self._git(root, "add", ".")
+            self._git(root, "commit", "-qm", "baseline")
+            with self.assertRaisesRegex(ValueError, "cannot read Git changes"):
+                git_changed_files(root, "missing-branch")
 
 
 if __name__ == "__main__":

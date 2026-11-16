@@ -33,7 +33,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 __banner__ = r"""
  _____     _              ____  _      _   
 |_   _|___| | _____ _ __ |  _ \(_) ___| |_ 
@@ -1391,7 +1391,7 @@ pre {
 <header>
   <div class="brand">
     <span>🧊 TokenDiet</span>
-    <span style="font-size: 0.75rem; color: var(--text-muted); font-weight: normal;">v1.3.0</span>
+    <span style="font-size: 0.75rem; color: var(--text-muted); font-weight: normal;">v1.3.1</span>
   </div>
   <div class="stats-bar">
     <div class="stat-pill">

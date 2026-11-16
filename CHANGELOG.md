@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.3.1 — 2026-11-16
+
+### CI
+- Pin GitHub Actions to Ubuntu 22.04 so the Python 3.8 and 3.9 matrix entries remain installable as `ubuntu-latest` advances.
+
 ## 1.3.0 — 2026-11-16
 
 ### Git-aware session context

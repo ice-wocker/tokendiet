@@ -1,0 +1,18 @@
+# Application Production Configuration
+app:
+  name: "TokenDiet Gateway"
+  port: 8080
+  debug: false
+
+# Database settings
+database:
+  host: "db.cluster.internal"
+  port: 5432
+  user: "postgres"
+  password: "super_secret_db_password_xyz987"
+  database: "analytics"
+
+# Security credentials (redacted during compression)
+security:
+  github_token: "ghp_demo_token_dummy_value_1234567890abcdef"
+  api_key: "ak_live_demo_dummy_token_998877665544332211"
